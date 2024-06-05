@@ -313,5 +313,3 @@ Distributed under the MIT license. See LICENSE.
 
 Code in vendor/rebel-readline originates from [rebel-readline](https://github.com/bhauman/rebel-readline) which is covered by the Eclipse Public License either version 1.0 or (at your option) any later version.
 
-#   D e p s - R e a d l i n e  
- 
