@@ -1,0 +1,164 @@
+name: Release
+run-name: ${{ inputs.version }}
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version to release (e.g. v1.2.3, v1.2.3-pre.1)'
+        type: string
+        required: true
+  push:
+    branches:
+      - master
+      - feature/dockerfile
+
+jobs:
+  Config:
+    runs-on: ubuntu-latest
+    # version (v1.2.3, v1.2.3-9-adfh), release-name (unstable, stable, v1.2.3)
+    outputs:
+      tagged-release: ${{ steps.provided.outputs.version && true }}
+      version: ${{ steps.provided.outputs.version || steps.derived.outputs.version }}
+      release-name: ${{ steps.provided.outputs.release-name || steps.derived.outputs.release-name }}
+      stable: ${{ steps.provided.outputs.stable }}
+      pre-release: ${{ steps.provided.outputs.pre-release || steps.derived.outputs.pre-release }}
+    steps:
+      - name: Check out repository code
+        uses: actions/checkout@v3
+        with:
+          fetch-depth: 0
+      - name: Validate provided version
+        if: "${{ inputs.version != '' }}"
+        id: provided
+        run: |
+          if ! echo "${{ inputs.version }}" | grep -qE '^v[[:digit:]]+\.[[:digit:]]+\.[[:digit:]]+(-pre\.[[:digit:]]+)?$'; then
+            echo "::error::The supplied version (${{ inputs.version }}) is not a valid version string."
+            exit 1
+          fi
+          if echo "${{ inputs.version }}" | grep -qE '^v[[:digit:]]+\.[[:digit:]]+\.[[:digit:]]+-pre\.[[:digit:]]+$'; then
+            echo "pre-release=true" >> $GITHUB_OUTPUT
+          else
+            echo "pre-release=false" >> $GITHUB_OUTPUT
+            echo "stable=true" >> $GITHUB_OUTPUT
+          fi
+          echo "version=${{ inputs.version }}" >> $GITHUB_OUTPUT
+          echo "release-name=${{ inputs.version }}" >> $GITHUB_OUTPUT
+          echo "release-sha=${{ github.sha }}" >> $GITHUB_OUTPUT
+      - name: Derive version
+        if: "${{ inputs.version == '' }}"
+        id: derived
+        run: |
+          echo "version=$(git describe --tags)" >> $GITHUB_OUTPUT
+          echo "release-name=unstable" >> $GITHUB_OUTPUT
+          echo "release-sha=${{ github.sha }}" >> $GITHUB_OUTPUT
+          echo "pre-release=true" >> $GITHUB_OUTPUT
+          echo "stable=false" >> $GITHUB_OUTPUT
+  Build:
+    needs: [Config]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository code
+        uses: actions/checkout@v3
+        with:
+          fetch-depth: 0
+      - name: Install clojure tools
+        uses: DeLaGuardo/setup-clojure@9.4
+        with:
+          bb: latest
+      - name: Update VERSION
+        run: echo "${{ needs.Config.outputs.version }}" > resources/VERSION
+      - name: Zip it
+        run: zip -r deps-try.zip . -x ".git/*"
+      - name: Build uberjar
+        run: bb uberjar deps-try-bb.jar -m eval.deps-try
+      - name: Testrun uberjar
+        run: bb deps-try-bb.jar -h
+      - name: Release stable
+        if: "${{ needs.Config.outputs.stable }}"
+        uses: softprops/action-gh-release@v1
+        with:
+          body: |
+            - version: ${{ needs.Config.outputs.version }}
+            - SHA: ${{ github.sha }}
+            - Run with babashka: `bb deps-try-bb.jar`
+          prerelease: false
+          name: stable
+          target_commitish: 55863dbc940e0741b9d9b3a1b11fdbadd08e8bb5 # first commit
+          tag_name: stable
+          files: |
+            deps-try-bb.jar
+            deps-try.zip
+            resources/VERSION
+      - name: Release unstable
+        if: ${{ always() }}
+        uses: softprops/action-gh-release@v1
+        with:
+          body: |
+            - version: ${{ needs.Config.outputs.version }}
+            - SHA: ${{ github.sha }}
+            - Run with babashka: `bb deps-try-bb.jar`
+          prerelease: true
+          name: unstable
+          target_commitish: 55863dbc940e0741b9d9b3a1b11fdbadd08e8bb5 # first commit
+          tag_name: unstable
+          files: |
+            deps-try-bb.jar
+            deps-try.zip
+            resources/VERSION
+      - name: Tagged release
+        if: "${{ needs.Config.outputs.tagged-release }}"
+        uses: softprops/action-gh-release@v1
+        with:
+          body: |
+            - version: ${{ needs.Config.outputs.version }}
+            - SHA: ${{ github.sha }}
+            - Run with babashka: `bb deps-try-bb.jar`
+          prerelease: ${{ needs.Config.outputs.pre-release }}
+          name: ${{ needs.Config.outputs.release-name }}
+          target_commitish: ${{ github.sha }}
+          tag_name: ${{ needs.Config.outputs.release-name }}
+          files: |
+            deps-try-bb.jar
+            deps-try.zip
+            resources/VERSION
+  Dockerize:
+    needs: [Config, Build]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Check out repository code
+        uses: actions/checkout@v3
+        with:
+          fetch-depth: 0
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+      - name: Log in to the Container registry
+        uses: docker/login-action@65b78e6e13532edd9afa3aa52ac7964289d1a9c1
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Extract metadata (tags, labels) for Docker
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ghcr.io/eval/deps-try
+          tags: |
+            type=raw,value=latest,enable=${{ needs.Config.outputs.stable == 'true' }}
+            type=raw,value=stable,enable=${{ needs.Config.outputs.stable == 'true' }}
+            type=raw,value=unstable,enable=${{ needs.Config.outputs.pre-release == 'true' }}
+            type=pep440,pattern={{version}},value=${{ needs.Config.outputs.version }},enable=${{ needs.Config.outputs.stable == 'true' }}
+      - name: Build and push Docker image stable
+        uses: docker/build-push-action@v5
+        with:
+          context: docker
+          platforms: linux/amd64,linux/arm64
+          push: true
+          labels: ${{ steps.meta.outputs.labels }}
+          tags: ${{ steps.meta.outputs.tags }}
+          build-args: |
+            TAG=${{ needs.Config.outputs.stable == 'true' && 'stable' || 'unstable' }}
